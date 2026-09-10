@@ -2,6 +2,8 @@ from pathlib import Path
 import sys
 import time
 import re
+import json
+from collections import OrderedDict
 
 import pandas as pd
 
@@ -27,11 +29,6 @@ from validators import (
     validate_pin_exists,
     pin_state_match,
     detect_garbage,
-    detect_premise,
-    detect_building,
-    detect_street,
-    detect_locality,
-    detect_anchor,
     normalize_pin,
 )
 
@@ -107,6 +104,53 @@ def norm(value):
     return normalize_entity(
         safe_text(value)
     )
+
+
+def extract_locality_candidate(address):
+    """Extract an explicitly labeled locality/area candidate for P1 evidence."""
+    text = safe_text(address)
+    if not text:
+        return ""
+    patterns = (
+        r"\bLOCALITY\s*[-.:]?\s*([^,;]+)",
+        r"\bAREA\s*[-.:]?\s*([^,;]+)",
+        r"\bMOHALLA(?:H)?\s*[-.:]?\s*([^,;]+)",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.I)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return ""
+
+def build_address_metadata_json(
+    *,
+    address,
+    city,
+    state,
+    pin,
+    address_type,
+    extracted,
+    resolved,
+    statuses,
+    component_confidence,
+    routing,
+):
+    """Create a compact, auditable structured representation of one address."""
+    payload = {
+        "input": {
+            "address": safe_text(address),
+            "city": safe_text(city),
+            "state": safe_text(state),
+            "pincode": normalize_pin(pin),
+        },
+        "address_type": address_type,
+        "extracted_entities": {k: safe_text(v) for k, v in extracted.items()},
+        "resolved_entities": resolved,
+        "validation": statuses,
+        "component_confidence": component_confidence,
+        "routing": routing,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 # ============================================================
@@ -675,38 +719,16 @@ def enhanced_locality(
 # ENHANCED GEOGRAPHIC ANCHOR
 # ============================================================
 
-def enhanced_anchor(
-    address,
-    city,
-    state,
-    district,
-    village,
-    post_office,
-):
+def enhanced_anchor(address):
+    """Return address-text geographic anchor evidence only.
 
+    Structured City/State/PIN and values inferred from masters are not used
+    to manufacture completeness credit. The anchor must be visible in the
+    free-text address itself.
+    """
     text = safe_text(address).upper()
-
     if not text:
         return False
-
-    # --------------------------------------------------------
-    # Strong administrative anchors
-    # --------------------------------------------------------
-
-    if village:
-        return True
-
-    if post_office:
-        return True
-
-    if district:
-        return True
-
-    # --------------------------------------------------------
-    # Do NOT use structured City/State as an address anchor. Those fields
-    # are external metadata and should not manufacture address quality.
-    # Anchor credit must come from the address text itself.
-    # --------------------------------------------------------
 
     geographic_terms = [
         r"\bVILLAGE\b", r"\bVILL\b", r"\bGRAM\b", r"\bGAON\b",
@@ -714,15 +736,61 @@ def enhanced_anchor(
         r"\bDISTRICT\b", r"\bROAD\b", r"\bRD\b", r"\bSTREET\b",
         r"\bLANE\b", r"\bGALI\b", r"\bNAGAR\b", r"\bCOLONY\b",
         r"\bMOHALLA\b", r"\bAREA\b", r"\bSECTOR\b", r"\bWARD\b",
-        r"\bCHOWK\b", r"\bBASTI\b", r"\bPURA\b", r"\bDHANI\b",
-        r"\bENCLAVE\b", r"\bMARG\b", r"\bPATH\b", r"\bHIGHWAY\b",
-        r"\bCROSSING\b",
+        r"\bCHOWK\b", r"\bCHOWRAHA\b", r"\bBASTI\b", r"\bPURA\b",
+        r"\bDHANI\b", r"\bENCLAVE\b", r"\bMARG\b", r"\bPATH\b",
+        r"\bHIGHWAY\b", r"\bCROSSING\b", r"\bBLOCK\b",
     ]
 
-    if any(re.search(pattern, text) for pattern in geographic_terms):
-        return True
+    return any(re.search(pattern, text) for pattern in geographic_terms)
 
-    return False
+
+# ============================================================
+# ADDRESS TYPE + COMPONENT EXTRACTION
+# ============================================================
+
+# These markers are used only as a routing optimization: clearly urban
+# addresses skip expensive rural hierarchy inference.  They must therefore
+# be conservative and must not affect the quality score directly.
+RURAL_MARKERS = re.compile(
+    r"\b(?:VILL(?:AGE)?|GRAM|GAON|KHET|KHEDA|DHANI|TOLA|"
+    r"PURA|MAJRA|MAUZA|TEHSIL|TAHSIL|TALUKA?|MANDAL|"
+    r"SUB[- ]?DISTRICT|FARM HOUSE|FARMS)\b",
+    re.I,
+)
+
+URBAN_MARKERS = re.compile(
+    r"\b(?:FLAT|APARTMENT|RESIDENCY|RESIDENCE|TOWER|"
+    r"SECTOR|SHOPPING|COMPLEX|SOCIETY|ENCLAVE|COLONY|NAGAR|"
+    r"STREET|ROAD|LANE|MARG|GALI|CHOWK|WARD|MARKET|MALL|"
+    r"OFFICE|PLOT|HOUSE|HNO|DOOR|UNIT|SHOP)\b",
+    re.I,
+)
+
+def classify_address_type(address, city=""):
+    """Classify only for inference routing; UNKNOWN is intentionally common."""
+    text = safe_text(address)
+    if not text:
+        return "UNKNOWN"
+    if RURAL_MARKERS.search(text):
+        return "RURAL"
+    if URBAN_MARKERS.search(text):
+        return "URBAN"
+    return "UNKNOWN"
+
+
+def extract_components(address, city=""):
+    """Run completeness detectors once and reuse their evidence."""
+    premise = bool(enhanced_premise(address))
+    building = bool(enhanced_building(address))
+    street = bool(enhanced_street(address))
+    locality = bool(enhanced_locality(address))
+    return {
+        "premise": premise,
+        "building": building,
+        "street": street,
+        "locality": locality,
+        "anchor": bool(street or locality),
+    }
 
 
 # ============================================================
@@ -871,13 +939,39 @@ def village_hierarchy_score(
     return 0.0
 
 
+def get_village_hierarchy_status(village_res, village_supplied):
+    if not village_supplied:
+        return "NOT_CHECKED"
+    if village_res.status == PASS:
+        return PASS
+    if village_res.status == AMBIGUOUS:
+        return AMBIGUOUS
+    return FAIL
+
+
+def po_city_status(po_res, ulb_res, city, post_office_supplied):
+    if post_office_supplied:
+        if po_res.status == PASS:
+            return PASS
+        if po_res.status == AMBIGUOUS:
+            return AMBIGUOUS
+        return FAIL
+    if not city:
+        return "NOT_CHECKED"
+    if ulb_res.status == PASS:
+        return PASS
+    if ulb_res.status == AMBIGUOUS:
+        return AMBIGUOUS
+    return "NOT_CHECKED"
+
+
 def po_city_score(
     po_res,
     ulb_res,
     city,
     post_office_supplied,
 ):
-    # Explicit PO: validate it.
+    """Score postal/city evidence without treating missing optional fields as failures."""
     if post_office_supplied:
         if po_res.status == PASS:
             return 1.0
@@ -885,20 +979,16 @@ def po_city_score(
             return 0.5
         return 0.0
 
-    # PO is optional. City/ULB is a valid alternative geographic
-    # representation for urban addresses.
     if city:
         if ulb_res.status == PASS:
             return 1.0
         if ulb_res.status == AMBIGUOUS:
             return 0.5
-
-        # If PIN-State and PIN-District are consistent, lack of an
-        # explicit PO should not reduce the score.
-        return 1.0
+        # City may be a town/district name rather than an LGD ULB.
+        # Without positive reference evidence, remain neutral.
+        return 0.5
 
     return 0.5
-
 
 def preflight_input_guard(df):
     """Fail fast when an input schema/value problem would invalidate the run."""
@@ -1008,7 +1098,7 @@ def main():
 
     print("=" * 70)
     print(
-        "ADDRESS QUALITY VALIDATION - V5"
+        "ADDRESS QUALITY VALIDATION - P1"
     )
     print(
         "HIGH-RECALL EXTRACTION + SCORE/REVIEW SEPARATION"
@@ -1260,9 +1350,11 @@ def main():
     # ========================================================
     # Many customer rows share the same address/geography. Cache the
     # expensive geography preparation + resolution by normalized input.
-    geo_cache = {}
-    inference_cache = {}
-    po_cache = {}
+    MAX_CACHE_ENTRIES = 50000
+    geo_cache = OrderedDict()
+    inference_cache = OrderedDict()
+    po_cache = OrderedDict()
+    locality_cache = OrderedDict()
 
     total = len(df)
 
@@ -1270,10 +1362,9 @@ def main():
     # PROCESS ROWS
     # ========================================================
 
-    for i, (_, r) in enumerate(
-        df.iterrows(),
-        start=1,
-    ):
+    records = df.to_dict(orient="records")
+
+    for i, r in enumerate(records, start=1):
 
         address = r[address_c]
 
@@ -1329,6 +1420,16 @@ def main():
             else explicit["post_office"]
         )
 
+        # Preserve whether hierarchy fields were actually supplied by the
+        # customer/address text. Inferred master values are enrichment and
+        # must not later be described as customer corrections.
+        explicit_flags = {
+            "district": bool(supplied_district),
+            "subdistrict": bool(supplied_subdistrict),
+            "village": bool(supplied_village),
+            "post_office": bool(supplied_po),
+        }
+
         # ----------------------------------------------------
         # Normalize blank values
         # ----------------------------------------------------
@@ -1347,7 +1448,11 @@ def main():
 
         # ----------------------------------------------------
         # Fast geography inference with caching
+        # Rural hierarchy is resolved only for rural/unknown addresses.
+        # Clearly urban records do not pay the village/subdistrict inference cost.
         # ----------------------------------------------------
+        address_type = classify_address_type(address, city)
+
         inference_key = (
             norm(address),
             norm(city),
@@ -1362,6 +1467,7 @@ def main():
         cached_inference = inference_cache.get(inference_key)
 
         if cached_inference is not None:
+            inference_cache.move_to_end(inference_key)
             supplied_district, supplied_subdistrict, supplied_village, supplied_po = cached_inference
         else:
             if not supplied_district:
@@ -1369,12 +1475,12 @@ def main():
                     address, city, state, pin, resolver
                 )
 
-            if not supplied_subdistrict:
+            if address_type != "URBAN" and not supplied_subdistrict:
                 supplied_subdistrict = infer_subdistrict(
                     address, city, state, supplied_district, pin, resolver
                 )
 
-            if not supplied_village:
+            if address_type != "URBAN" and not supplied_village:
                 supplied_village = infer_village(
                     address, city, state, supplied_district, pin, resolver
                 )
@@ -1390,6 +1496,9 @@ def main():
                 supplied_village,
                 supplied_po,
             )
+            inference_cache.move_to_end(inference_key)
+            if len(inference_cache) > MAX_CACHE_ENTRIES:
+                inference_cache.popitem(last=False)
 
         # ====================================================
         # BASIC VALIDATION
@@ -1431,101 +1540,32 @@ def main():
             )
         )
 
-        # Original validator checks.
-        premise_original = detect_premise(
-            address
-        )
-
-        building_original = detect_building(
-            address
-        )
-
-        street_original = detect_street(
-            address
-        )
-
-        locality_original = detect_locality(
-            address,
-            city,
-        )
-
-        anchor_original = detect_anchor(
-            address,
-            city,
-            state,
-            supplied_district,
-        )
-
         # ====================================================
-        # ENHANCED COMPLETENESS
+        # SINGLE-PASS COMPONENT EXTRACTION
         # ====================================================
+        # The enhanced detectors are now the canonical completeness layer.
+        # Baseline validators are not executed again, eliminating duplicate
+        # regex work on every customer row.
+        components = extract_components(address, city)
 
-        premise_enhanced = (
-            enhanced_premise(
-                address
-            )
-        )
+        premise_pass = components["premise"]
+        building_pass = components["building"]
+        street_pass = components["street"]
+        locality_pass = components["locality"]
+        # Address-anchor evidence must come from the customer address text.
+        # Derived master values must not manufacture completeness credit.
+        anchor_pass = bool(enhanced_anchor(address))
 
-        building_enhanced = (
-            enhanced_building(
-                address
-            )
-        )
+        # Deterministic rule confidence for auditability. These values are
+        # heuristic evidence-strength indicators, not statistical calibration
+        # probabilities and do not alter the score.
+        component_confidence = {
+            "premise_confidence": 0.90 if premise_pass else 0.0,
+            "building_confidence": 0.90 if building_pass else 0.0,
+            "street_confidence": 0.90 if street_pass else 0.0,
+            "locality_confidence": 0.90 if locality_pass else 0.0,
+        }
 
-        street_enhanced = (
-            enhanced_street(
-                address
-            )
-
-        )
-
-        locality_enhanced = (
-            enhanced_locality(
-                address
-            )
-        )
-
-        anchor_enhanced = (
-            enhanced_anchor(
-                address,
-                city,
-                state,
-                supplied_district,
-                supplied_village,
-                supplied_po,
-            )
-        )
-
-        # ----------------------------------------------------
-        # Use either original validator OR enhanced detection.
-        # ----------------------------------------------------
-
-        premise_pass = (
-            premise_original.status == PASS
-            or premise_enhanced
-        )
-
-        building_pass = (
-            building_original.status == PASS
-            or building_enhanced
-        )
-
-        street_pass = (
-            street_original.status == PASS
-            or street_enhanced
-        )
-
-        locality_pass = (
-            locality_original.status == PASS
-            or locality_enhanced
-        )
-
-        anchor_pass = (
-            anchor_original.status == PASS
-            or anchor_enhanced
-        )
-
-        # ====================================================
         # GEOGRAPHIC RESOLUTION
         # ====================================================
 
@@ -1542,6 +1582,9 @@ def main():
 
         geo = geo_cache.get(geo_key)
 
+        if geo is not None:
+            geo_cache.move_to_end(geo_key)
+
         if geo is None:
             geo = resolver.resolve_address(
                 address=address,
@@ -1554,6 +1597,9 @@ def main():
                 pin=pin,
             )
             geo_cache[geo_key] = geo
+            geo_cache.move_to_end(geo_key)
+            if len(geo_cache) > MAX_CACHE_ENTRIES:
+                geo_cache.popitem(last=False)
 
         district_res = geo[
             "district"
@@ -1574,6 +1620,33 @@ def main():
         ulb_res = geo[
             "ulb"
         ]
+
+        # P1 locality evidence: only explicitly labeled locality/area values
+        # are sent to LGD fuzzy resolution. Private colony/street names are
+        # not expected to exist in LGD and remain NOT_CHECKED.
+        locality_candidate = extract_locality_candidate(address)
+        locality_key = (
+            norm(locality_candidate),
+            canonical_state(state),
+            norm(district_res.match_value),
+            norm(subdistrict_res.match_value),
+            normalize_pin(pin),
+        )
+        locality_res = locality_cache.get(locality_key)
+        if locality_res is not None:
+            locality_cache.move_to_end(locality_key)
+        else:
+            locality_res = resolver.resolve_locality(
+                locality_candidate,
+                state=state,
+                district=district_res.match_value,
+                subdistrict=subdistrict_res.match_value,
+                pin=pin,
+            )
+            locality_cache[locality_key] = locality_res
+            locality_cache.move_to_end(locality_key)
+            if len(locality_cache) > MAX_CACHE_ENTRIES:
+                locality_cache.popitem(last=False)
 
         # ====================================================
         # GEO COMPONENTS
@@ -1641,6 +1714,18 @@ def main():
                 city,
                 bool(supplied_po),
             )
+        )
+
+        village_hierarchy_status = get_village_hierarchy_status(
+            village_res,
+            bool(supplied_village),
+        )
+
+        po_city_status_value = po_city_status(
+            po_res,
+            ulb_res,
+            city,
+            bool(supplied_po),
         )
 
         # ====================================================
@@ -1883,48 +1968,59 @@ def main():
             scores["quality_score"]
         )
 
+        # Operational routing is deliberately separate from quality_class.
+        # Hard invalids always reject; otherwise score bands route the work.
+        if hard_invalid or scores["quality_score"] < 60:
+            operational_queue = "fatal_rejects"
+        elif scores["quality_score"] >= 85:
+            operational_queue = "auto_dispatch"
+        else:
+            operational_queue = "manual_review"
+
+        # ====================================================
+        # QC REVIEW REASONS
+        # ====================================================
+        # These are review triggers, not score/class overrides. Only
+        # customer-supplied contradictions are elevated to QC review.
         review_reasons = []
 
         if ps.status == FAIL:
-            review_reasons.append(
-                "PIN-State inconsistency"
-            )
+            review_reasons.append("PIN_STATE_MISMATCH")
         elif ps.status == AMBIGUOUS:
-            review_reasons.append(
-                "PIN-State mapping is ambiguous"
-            )
+            review_reasons.append("PIN_STATE_AMBIGUOUS")
+
+        if explicit_flags["village"]:
+            if village_res.status == FAIL:
+                review_reasons.append("VILLAGE_UNVALIDATED")
+            elif village_res.status == AMBIGUOUS:
+                review_reasons.append("VILLAGE_AMBIGUOUS")
+
+        if explicit_flags["subdistrict"]:
+            if subdistrict_res.status == FAIL:
+                review_reasons.append("SUBDISTRICT_UNVALIDATED")
+            elif subdistrict_res.status == AMBIGUOUS:
+                review_reasons.append("SUBDISTRICT_AMBIGUOUS")
+
+        # If an explicit PO was supplied, a failed/ambiguous PO resolution
+        # is a locality verification issue. Inferred PO failures are neutral.
+        if explicit_flags["post_office"]:
+            if po_res.status == FAIL:
+                review_reasons.append("POST_OFFICE_UNVALIDATED")
+            elif po_res.status == AMBIGUOUS:
+                review_reasons.append("POST_OFFICE_AMBIGUOUS")
 
 
+        if locality_candidate:
+            if locality_res.status == FAIL:
+                review_reasons.append("LOCALITY_UNVALIDATED")
+            elif locality_res.status == AMBIGUOUS:
+                review_reasons.append("LOCALITY_AMBIGUOUS")
 
-        if (
-            village_res.status == FAIL
-            and supplied_village
-        ):
-            review_reasons.append(
-                "Village could not be validated in LGD"
-            )
-
-        if (
-            village_res.status == AMBIGUOUS
-            and supplied_village
-        ):
-            review_reasons.append(
-                "Village resolution is ambiguous"
-            )
-
-        if (
-            subdistrict_res.status == FAIL
-            and supplied_subdistrict
-        ):
-            review_reasons.append(
-                "Subdistrict could not be validated in LGD"
-            )
-
+        review_reason = "; ".join(review_reasons)
         review_flag = bool(review_reasons)
 
-        review_reason = "; ".join(
-            review_reasons
-        )
+        if review_flag and operational_queue == "auto_dispatch":
+            operational_queue = "manual_review"
 
         # ====================================================
         # CORRECTION SUGGESTION
@@ -1938,64 +2034,35 @@ def main():
 
         corrections = []
 
-        # --------------------------------------------------------
-        # Safe normalization corrections
-        # --------------------------------------------------------
-        if (
-            normalized_pin
-            and safe_text(pin)
-            != normalized_pin
-        ):
-            corrections.append(
-                f"PIN {pin} → {normalized_pin}"
-            )
-
-        if (
-            supplied_district
-            and district_res.status == PASS
-            and norm(supplied_district)
-            != norm(district_res.match_value)
-        ):
-            corrections.append(
-                f"District {supplied_district} "
-                f"→ {district_res.match_value}"
-            )
-
-        # --------------------------------------------------------
-        # Data-entry corrections
-        # These are instructions, not guessed geographic values.
-        # --------------------------------------------------------
+        # Corrections are reserved for actual defects or verification needs.
+        # Optional missing building/street/locality detail is NOT a correction.
         if garbage.status == FAIL:
             corrections.append(
-                "Replace the current address text with a complete "
-                "premise + locality/road address"
+                "Recapture a complete premise and locality/road address"
             )
-        else:
-            if not premise_pass:
-                corrections.append(
-                    "Add a house/flat/plot/premise identifier"
-                )
-
-            if not building_pass:
-                corrections.append(
-                    "Add building/property name if applicable"
-                )
-
-            if not street_pass:
-                corrections.append(
-                    "Add road/street/sector/gali details if applicable"
-                )
-
-            if not locality_pass:
-                corrections.append(
-                    "Add locality/colony/area details"
-                )
-
-        if review_flag:
+        elif pin_ex.status == FAIL:
             corrections.append(
-                "Verify the conflicting geographic field(s) against "
-                "the PIN/LGD hierarchy"
+                "Verify and correct the 6-digit PIN"
             )
+        elif ps.status == FAIL:
+            corrections.append(
+                "Verify State against the supplied PIN"
+            )
+
+        if "VILLAGE_UNVALIDATED" in review_reasons:
+            corrections.append("Verify Village against LGD hierarchy")
+        elif "VILLAGE_AMBIGUOUS" in review_reasons:
+            corrections.append("Confirm the correct Village name")
+
+        if "SUBDISTRICT_UNVALIDATED" in review_reasons:
+            corrections.append("Verify Subdistrict against LGD hierarchy")
+        elif "SUBDISTRICT_AMBIGUOUS" in review_reasons:
+            corrections.append("Confirm the correct Subdistrict")
+
+        if "POST_OFFICE_UNVALIDATED" in review_reasons:
+            corrections.append("Verify Post Office against the PIN")
+        elif "POST_OFFICE_AMBIGUOUS" in review_reasons:
+            corrections.append("Confirm the correct Post Office")
 
         # Keep the field human-readable and bounded.
         correction = "; ".join(corrections[:4])
@@ -2049,16 +2116,66 @@ def main():
 
         # No correction text for a clean ACCEPT outcome. Optional enrichment
         # may still retain actionable suggestions.
-        if action == "ACCEPT":
+        if action in {"ACCEPT", "ACCEPT – OPTIONAL ENRICHMENT"}:
             correction = ""
 
         # ====================================================
         # OUTPUT ROW
         # ====================================================
 
-        x = r.to_dict()
+        x = dict(r)
 
         x.update({
+
+            "address_type":
+                address_type,
+
+            "district_explicit_in_input": explicit_flags["district"],
+            "subdistrict_explicit_in_input": explicit_flags["subdistrict"],
+            "village_explicit_in_input": explicit_flags["village"],
+            "post_office_explicit_in_input": explicit_flags["post_office"],
+
+            "address_metadata_json":
+                build_address_metadata_json(
+                    address=address,
+                    city=city,
+                    state=state,
+                    pin=normalized_pin,
+                    address_type=address_type,
+                    extracted={
+                        "district": supplied_district,
+                        "subdistrict": supplied_subdistrict,
+                        "village": supplied_village,
+                        "post_office": supplied_po,
+                    },
+                    resolved={
+                        "district": district_res.match_value,
+                        "subdistrict": subdistrict_res.match_value,
+                        "village": village_res.match_value,
+                        "post_office": po_res.match_value,
+                        "ulb": ulb_res.match_value,
+                        "locality": locality_res.match_value,
+                    },
+                    statuses={
+                        "pin_state": ps.status,
+                        "village": village_res.status,
+                        "subdistrict": subdistrict_res.status,
+                        "post_office": po_res.status,
+                        "pin_district_evidence": pin_district_status,
+                        "locality": locality_res.status,
+                    },
+                    component_confidence=component_confidence,
+                    routing={
+                        "quality_class": quality_class,
+                        "quality_score": scores["quality_score"],
+                        "qc_review_flag": review_flag,
+                        "qc_review_reason": review_reason,
+                        "operational_queue": operational_queue,
+                    },
+                ),
+
+            "operational_queue":
+                operational_queue,
 
             "normalized_pincode":
                 normalized_pin,
@@ -2253,6 +2370,21 @@ def main():
             "ulb_resolution_source":
                 ulb_res.source,
 
+            "locality_candidate":
+                locality_candidate,
+
+            "locality_resolution_status":
+                locality_res.status,
+
+            "locality_resolution_score":
+                round(locality_res.match_score, 4),
+
+            "locality_resolution_source":
+                locality_res.source,
+
+            "resolved_locality":
+                locality_res.match_value,
+
             # ------------------------------------------------
             # Geo checks
             # ------------------------------------------------
@@ -2264,10 +2396,28 @@ def main():
                 pin_district_status,
 
             "geo_village_hierarchy_status":
-                village_hierarchy_fraction,
+                village_hierarchy_status,
+
+            "geo_village_hierarchy_score":
+                round(village_hierarchy_fraction, 4),
 
             "geo_po_city_status":
-                po_city_fraction,
+                po_city_status_value,
+
+            "geo_po_city_score":
+                round(po_city_fraction, 4),
+
+            "geo_anchor_status":
+                PASS if anchor_pass else FAIL,
+
+            # ------------------------------------------------
+            # Component evidence confidence
+            # ------------------------------------------------
+
+            **component_confidence,
+
+            "geo_confidence_basis":
+                "ADMINISTRATIVE_GEOGRAPHY_ONLY",
 
             # ------------------------------------------------
             # Scores
@@ -2352,6 +2502,8 @@ def main():
     print(
         f"      Geography cache keys: {len(geo_cache):,}"
     )
+    print(f"      Locality cache keys: {len(locality_cache):,}")
+    print(    )
 
     # ========================================================
     # OUTPUT

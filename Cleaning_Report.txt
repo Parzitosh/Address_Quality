@@ -1,0 +1,18 @@
+ADDRESS CLEANING REPORT
+============================================================
+Input file: SMFG - Query result.csv
+Output file: Cleaned_Address_Data.csv
+Input rows: 66252
+Output rows: 66252
+Rows removed: 0
+Duplicate records removed: 0
+Duplicate Lead Codes / rows removed: 0
+Rows with structured-field changes: 0
+Empty Full Address: 0
+Empty City: 0
+Empty State: 0
+Empty Pincode: 315
+Invalid Pincode Length: 315
+Pincodes Starting With Zero: 0
+Address records with redundant components cleaned: 66151
+Total address components removed: 285718

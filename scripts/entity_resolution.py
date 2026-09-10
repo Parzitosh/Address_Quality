@@ -1928,6 +1928,92 @@ class GeographicResolver:
         )
 
     # ========================================================
+
+    # ========================================================
+    # LOCALITY (P1)
+    # ========================================================
+
+    def resolve_locality(
+        self,
+        value,
+        state="",
+        district="",
+        subdistrict="",
+        pin="",
+    ) -> Resolution:
+        """
+        Resolve locality-like values against available LGD entities.
+
+        LGD does not contain private colony/street names, so a locality
+        non-match is evidence-only and must never become a hard quality
+        failure.
+        """
+        raw = "" if value is None else str(value)
+        query = normalize_entity(value)
+
+        if not query:
+            return Resolution(
+                "LOCALITY", raw, query, "NOT_CHECKED",
+                reason="No locality supplied."
+            )
+
+        for entity_type, index, master_key, token_index in (
+            ("ULB", self.ulb_by_name, "ulb", self.ulb_token_index),
+            ("VILLAGE", self.village_by_name, "village", self.village_token_index),
+        ):
+            rows = self._context_filter(
+                self._rows(master_key, index.get(query, [])),
+                state=state,
+                district=district,
+                pin=pin,
+                subdistrict=subdistrict,
+            )
+            if len(rows) == 1:
+                return self._resolution_from_row(
+                    entity_type, raw, query, "PASS", query, 1.0,
+                    rows[0], f"LGD_{entity_type}_EXACT",
+                    f"Locality matched {entity_type} exactly."
+                )
+            if len(rows) > 1:
+                return Resolution(
+                    "LOCALITY", raw, query, "AMBIGUOUS",
+                    query, 1.0, source=f"LGD_{entity_type}_EXACT",
+                    reason="Locality name has multiple geographic matches."
+                )
+
+            names = self._token_candidate_names(query, token_index)
+            if not names:
+                continue
+
+            for best, score in self._fuzzy_candidates(
+                query, names, limit=3
+            ):
+                rows = self._context_filter(
+                    self._rows(master_key, index.get(best, [])),
+                    state=state,
+                    district=district,
+                    pin=pin,
+                    subdistrict=subdistrict,
+                )
+                if len(rows) == 1 and score >= FUZZY_PASS:
+                    return self._resolution_from_row(
+                        entity_type, raw, query, "PASS", best, score,
+                        rows[0], f"LGD_{entity_type}_FUZZY",
+                        f"Locality resolved with a strong fuzzy {entity_type} match."
+                    )
+                if score >= FUZZY_REVIEW:
+                    return Resolution(
+                        "LOCALITY", raw, query, "AMBIGUOUS",
+                        best, score, source=f"LGD_{entity_type}_FUZZY",
+                        reason="Plausible fuzzy locality match requires review."
+                    )
+
+        return Resolution(
+            "LOCALITY", raw, query, "FAIL",
+            source="LGD",
+            reason="Locality not found in available LGD geographic entities."
+        )
+
     # COMPLETE ADDRESS RESOLUTION
     # ========================================================
 

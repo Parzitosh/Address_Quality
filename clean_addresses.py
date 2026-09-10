@@ -9,7 +9,7 @@ import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
 
-INPUT_FILE = BASE_DIR / "NON MFI - Query result.csv"
+INPUT_FILE = BASE_DIR / "SMFG - Query result.csv"
 
 OUTPUT_FILE = BASE_DIR / "Cleaned_Address_Data.csv"
 REPORT_FILE = BASE_DIR / "Cleaning_Report.txt"
