@@ -73,6 +73,7 @@ STATE_ABBREVIATIONS = {
     "TN": "TAMIL NADU",
     "TS": "TELANGANA",
     "AP": "ANDHRA PRADESH",
+    "TG": "TELANGANA",
     "GJ": "GUJARAT",
     "MH": "MAHARASHTRA",
     "BR": "BIHAR",
@@ -270,8 +271,8 @@ def remove_trailing_metadata(text, state="", pincode=""):
                 flags=re.I,
             )
 
-    # Remove known full state aliases only at the end.
-    for alias in sorted(STATE_ALIASES, key=len, reverse=True):
+    # Remove known state variants (full name + abbreviations) only at the end.
+    for alias in state_variants(state):
         pattern = phrase_pattern(alias)
         if pattern:
             text = re.sub(
@@ -559,95 +560,363 @@ def clean_address(address, city="", state="", pincode=""):
 
 
 # ============================================================
-# FLAGS / REPORTING
-# ============================================================
-
-def has_redundancy(original, cleaned):
-    """True only when address content was actually removed, not just reformatted."""
-    return count_removed_components(original, cleaned) > 0
-
-
-def count_removed_components(original, cleaned):
-    """
-    Approximate count of removed address components using normalized
-    token multiset comparison. It is a reporting metric, not a validator.
-    """
-    original_tokens = normalize_for_matching(original).split()
-    cleaned_tokens = normalize_for_matching(cleaned).split()
-
-    from collections import Counter
-
-    before = Counter(original_tokens)
-    after = Counter(cleaned_tokens)
-
-    removed = 0
-    for token, count in before.items():
-        removed += max(0, count - after.get(token, 0))
-
-    return removed
-
-
-def detect_garbage(text):
-    """
-    Conservative garbage/metadata-only detection.
-
-    Returns True only for obvious non-address content.
-    """
-    if not is_meaningful(text):
-        return False
-
-    norm = normalize_for_matching(text)
-
-    # Obvious placeholders / repeated single geographic metadata.
-    if norm in PLACEHOLDER_VALUES:
-        return True
-
-    words = norm.split()
-
-    # Examples such as "MEERUT MEERUT".
-    if len(words) == 2 and words[0] == words[1]:
-        return True
-
-    # Purely geographic metadata is not a useful premise address.
-    if len(words) <= 3:
-        geo_words = {
-            "INDIA",
-            "UP",
-            "MP",
-            "RJ",
-            "HR",
-            "PB",
-            "DELHI",
-        }
-        if all(w in geo_words for w in words):
-            return True
-
-    return False
-
 
 # ============================================================
-# INPUT / OUTPUT
+# MULTI-ADDRESS RAW INPUT EXTRACTION
 # ============================================================
 
-def find_input_file():
-    if INPUT_FILE.exists():
-        return INPUT_FILE
+ADDRESS_OUTPUTS = {
+    "Current Address": "Cleaned_Current_Address_Data.csv",
+    "Office Address": "Cleaned_Office_Address_Data.csv",
+    "Alternate Address": "Cleaned_Alternate_Address_Data.csv",
+}
 
-    raise FileNotFoundError(
-        f"Input file not found:\n{INPUT_FILE}"
+STATE_MATCH_ORDER = sorted(
+    list(STATE_ALIASES.keys()) + list(STATE_ABBREVIATIONS.keys()),
+    key=len,
+    reverse=True,
+)
+
+def find_pincode_in_address(address, valid_pins=None):
+    """Extract the best 6-digit PIN from raw free text."""
+    text = clean_text(address)
+    matches = re.findall(r"(?<!\d)(\d{6})(?!\d)", text)
+    if not matches:
+        return ""
+
+    if valid_pins:
+        valid = [p for p in matches if p in valid_pins]
+        if valid:
+            return valid[-1]
+
+    return matches[-1]
+
+
+def find_state_in_address(address):
+    """
+    Extract a state from free text.
+
+    Long/full state names are preferred over abbreviations. If multiple
+    states occur, prefer the occurrence nearest the end of the address.
+    """
+    text = normalize_for_matching(address)
+    if not text:
+        return ""
+
+    candidates = []
+
+    for candidate in STATE_MATCH_ORDER:
+        canonical = canonical_state(candidate)
+        candidate_n = normalize_for_matching(candidate)
+        if not candidate_n:
+            continue
+
+        pattern = rf"(?<![A-Z0-9]){re.escape(candidate_n)}(?![A-Z0-9])"
+        for m in re.finditer(pattern, text, flags=re.I):
+            candidates.append((m.start(), len(candidate_n), canonical))
+
+    if not candidates:
+        return ""
+
+    # Prefer the latest occurrence; for equal position prefer the longer match.
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return candidates[-1][2]
+
+
+def state_variants(canonical):
+    """Return full name/abbreviations that map to the canonical state."""
+    target = canonical_state(canonical)
+    if not target:
+        return []
+
+    variants = []
+    for value in list(STATE_ALIASES.keys()) + list(STATE_ABBREVIATIONS.keys()):
+        if canonical_state(value) == target:
+            variants.append(value)
+    variants.append(target)
+
+    return sorted(
+        set(variants),
+        key=lambda x: len(normalize_for_matching(x)),
+        reverse=True,
     )
 
-def validate_columns(df):
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError(
-            "Missing required columns: "
-            + ", ".join(missing)
+
+def remove_state_variants(text, state):
+    working = normalize_for_matching(text)
+    for variant in state_variants(state):
+        variant_n = normalize_for_matching(variant)
+        if not variant_n:
+            continue
+        working = re.sub(
+            rf"(?<![A-Z0-9]){re.escape(variant_n)}(?![A-Z0-9])",
+            " ",
+            working,
+            flags=re.I,
+        )
+    return re.sub(r"\s+", " ", working).strip(" ,")
+
+
+def strip_metadata_from_text(text, state="", pincode=""):
+    """Remove only clearly identified state/PIN metadata from free text."""
+    working = clean_text(text)
+
+    pin = normalize_pin(pincode)
+    if pin:
+        working = re.sub(
+            rf"(?<!\d){re.escape(pin)}(?!\d)",
+            " ",
+            working,
+            flags=re.I,
         )
 
+    if state:
+        working = remove_state_variants(working, state)
 
-def process_file():
-    input_file = find_input_file()
+    working = re.sub(r"\s+", " ", working).strip(" ,")
+    return working
+
+
+def looks_like_city_candidate(value, state="", pincode=""):
+    """
+    Conservative city/town candidate test.
+
+    We do not fuzzy-invent a city. A candidate must be a meaningful geographic
+    phrase and must not obviously be a premise/route fragment.
+    """
+    value = clean_text(value).strip(" ,")
+    if not value:
+        return False
+
+    normalized = normalize_for_matching(value)
+    if not normalized or normalized in PLACEHOLDER_VALUES:
+        return False
+
+    if pincode and normalized == normalize_for_matching(pincode):
+        return False
+
+    if state and normalized == normalize_for_matching(state):
+        return False
+
+    # Don't select obvious premise-only segments.
+    if re.search(
+        r"\b(?:HNO|HOUSE|FLAT|PLOT|SHOP|ROAD|RD|STREET|ST|LANE|"
+        r"MARG|GALI|NEAR|OPP|OPPOSITE|BEHIND|BESIDE|COLONY|"
+        r"NAGAR|SOCIETY|APARTMENT|BUILDING|TOWER|COMPLEX)\b",
+        normalized,
+    ):
+        return False
+
+    # A candidate that is just a short number is not a city.
+    if re.fullmatch(r"\d+", normalized):
+        return False
+
+    return True
+
+
+def extract_city_from_address(address, state="", pincode="", postal_offices=None):
+    """
+    Infer City/Town conservatively from the raw address.
+
+    Priority:
+      1. Segment containing PIN, after removing State.
+      2. Nearby trailing geographic segment.
+      3. India Post office name for the PIN when explicitly present.
+      4. Last plausible segment.
+
+    This is extraction, not fuzzy city guessing.
+    """
+    text = clean_text(address)
+    if not text:
+        return ""
+
+    state_n = normalize_for_matching(state)
+    pin = normalize_pin(pincode)
+
+    # First use comma/semicolon/pipe boundaries.
+    segments = [
+        x.strip(" ,")
+        for x in re.split(r"[,;|]+", text)
+        if x.strip(" ,")
+    ]
+
+    # Search from the end because Indian addresses usually append geography.
+    candidates = []
+
+    for seg in reversed(segments):
+        candidate = clean_text(seg)
+
+        # Remove PIN and state from this segment.
+        if pin:
+            candidate = re.sub(
+                rf"(?<!\d){re.escape(pin)}(?!\d)",
+                " ",
+                candidate,
+                flags=re.I,
+            )
+
+        if state:
+            candidate = remove_state_variants(candidate, state)
+
+        candidate = re.sub(r"\s+", " ", candidate).strip(" ,-/")
+
+        if looks_like_city_candidate(candidate, state, pin):
+            candidates.append(candidate)
+
+    if candidates:
+        # Prefer a short geographic segment near the end.
+        return candidates[0]
+
+    # Delimiter-free fallback: use postal-office names only when explicitly
+    # present in the address and associated with the extracted PIN.
+    if postal_offices and pin:
+        address_n = normalize_for_matching(text)
+        office_candidates = []
+        for office in postal_offices.get(pin, []):
+            office_n = normalize_for_matching(office)
+            if len(office_n) < 3:
+                continue
+            pattern = rf"(?<![A-Z0-9]){re.escape(office_n)}(?![A-Z0-9])"
+            if re.search(pattern, address_n, flags=re.I):
+                office_candidates.append(office)
+        if office_candidates:
+            office_candidates.sort(
+                key=lambda x: len(normalize_for_matching(x)),
+                reverse=True,
+            )
+            return clean_text(office_candidates[0])
+
+    # Final conservative fallback for delimiter-free input:
+    # remove metadata and take the final plausible phrase.
+    body = strip_metadata_from_text(text, state, pin)
+    words = body.split()
+    if not words:
+        return ""
+
+    # Avoid returning an entire long premise as a city.
+    # Look at the last 1-4 tokens and select the shortest plausible suffix.
+    for n in range(1, min(4, len(words)) + 1):
+        candidate = " ".join(words[-n:])
+        if looks_like_city_candidate(candidate, state, pin):
+            return candidate
+
+    return ""
+
+
+def build_postal_office_index():
+    """Load a lightweight PIN -> Post Office-name index when available."""
+    master_path = BASE_DIR / "masters" / "india_post_master.csv"
+    if not master_path.exists():
+        return {}
+
+    try:
+        master = pd.read_csv(
+            master_path,
+            usecols=["officename", "pincode"],
+            dtype=str,
+        )
+    except Exception:
+        return {}
+
+    index = {}
+    for pin, group in master.groupby("pincode", dropna=False):
+        pin_n = normalize_pin(pin)
+        if not pin_n:
+            continue
+
+        offices = []
+        for office in group["officename"].fillna("").astype(str):
+            office = clean_text(office)
+            if office and office not in offices:
+                offices.append(office)
+
+        index[pin_n] = offices
+
+    return index
+
+
+def clean_single_address(address, city, state, pincode, postal_offices):
+    """
+    Produce the same cleaned-address structure used by address_quality.py,
+    but derive City/State/PIN directly from the raw address when absent.
+    """
+    raw = clean_text(address)
+
+    pin = find_pincode_in_address(raw)
+    state_value = find_state_in_address(raw)
+
+    # If structured extraction finds no state, preserve an empty state.
+    city_value = extract_city_from_address(
+        raw,
+        state=state_value,
+        pincode=pin,
+        postal_offices=postal_offices,
+    )
+
+    # Clean address body using the extracted metadata.
+    cleaned = clean_address(
+        address=raw,
+        city=city_value,
+        state=state_value,
+        pincode=pin,
+    )
+
+    return {
+        "Clean Full Address": cleaned,
+        "Clean City": city_value,
+        "Clean Pincode": pin,
+        "Clean State": state_value,
+    }
+
+
+def process_address_column(df, address_column, output_filename, postal_offices):
+    """
+    Process one of Current/Office/Alternate Address columns.
+
+    LAN is preserved exactly. No row deduplication is performed.
+    """
+    output_rows = []
+
+    for row in df[["LAN", address_column]].itertuples(index=False, name=None):
+        lan, raw_address = row
+
+        cleaned = clean_single_address(
+            address=raw_address,
+            city="",
+            state="",
+            pincode="",
+            postal_offices=postal_offices,
+        )
+
+        output_rows.append({
+            "LAN": lan,
+            "Clean Full Address": cleaned["Clean Full Address"],
+            "Clean City": cleaned["Clean City"],
+            "Clean Pincode": cleaned["Clean Pincode"],
+            "Clean State": cleaned["Clean State"],
+            "Original Address": clean_text(raw_address),
+        })
+
+    result = pd.DataFrame(output_rows)
+
+    output_path = BASE_DIR / output_filename
+    result.to_csv(
+        output_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print(f"  Created: {output_path.name} ({len(result):,} rows)")
+    return output_path
+
+
+def process_multi_address_file():
+    input_file = BASE_DIR / "BOBCARD - All Address.csv"
+
+    if not input_file.exists():
+        raise FileNotFoundError(
+            f"Raw multi-address file not found:\n{input_file}"
+        )
 
     df = pd.read_csv(
         input_file,
@@ -655,178 +924,51 @@ def process_file():
         keep_default_na=False,
     )
 
-    validate_columns(df)
+    required = ["LAN", "Current Address", "Office Address"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing required columns: {missing}. "
+            f"Available columns: {list(df.columns)}"
+        )
 
-    original_rows = len(df)
-
-    # --------------------------------------------------------
-    # Repair structured fields first.
-    # --------------------------------------------------------
-    repaired = df.apply(
-        lambda row: repair_structured_fields(
-            row["City"],
-            row["State"],
-            row["Pincode"],
-        ),
-        axis=1,
-        result_type="expand",
-    )
-
-    repaired.columns = [
-        "_Clean City",
-        "_Clean State",
-        "_Clean Pincode",
+    address_columns = [
+        c for c in ["Current Address", "Office Address", "Alternate Address"]
+        if c in df.columns
     ]
 
-    df["_Clean City"] = repaired["_Clean City"]
-    df["_Clean State"] = repaired["_Clean State"]
-    df["_Clean Pincode"] = repaired["_Clean Pincode"]
-
-    # --------------------------------------------------------
-    # Clean address AFTER structured fields are repaired.
-    # --------------------------------------------------------
-    df["_Clean Full Address"] = df.apply(
-        lambda row: clean_address(
-            address=row["Full Address"],
-            city=row["_Clean City"],
-            state=row["_Clean State"],
-            pincode=row["_Clean Pincode"],
-        ),
-        axis=1,
-    )
-
-    # --------------------------------------------------------
-    # Build required output columns.
-    # --------------------------------------------------------
-    output = pd.DataFrame({
-        "Lead Code": df["Lead Code"],
-        "Clean Full Address": df["_Clean Full Address"],
-        "Clean City": df["_Clean City"],
-        "Clean Pincode": df["_Clean Pincode"],
-        "Clean State": df["_Clean State"],
-    })
-
-    output["Address Empty"] = ~output["Clean Full Address"].map(is_meaningful)
-    output["City Empty"] = ~output["Clean City"].map(is_meaningful)
-    output["State Empty"] = ~output["Clean State"].map(is_meaningful)
-    output["Pincode Empty"] = output["Clean Pincode"].eq("")
-    output["Pincode Length Valid"] = output["Clean Pincode"].str.fullmatch(
-        r"\d{6}",
-        na=False,
-    )
-    output["Pincode Starts With Zero"] = output["Clean Pincode"].str.startswith(
-        "0",
-        na=False,
-    )
-
-    output["Address Duplicate Components Removed"] = df.apply(
-        lambda row: has_redundancy(
-            row["Full Address"],
-            row["_Clean Full Address"],
-        ),
-        axis=1,
-    )
-
-    output["Address Redundancy Cleaned"] = output[
-        "Address Duplicate Components Removed"
-    ]
-
-    output["Original Full Address"] = df["Full Address"]
-    output["Original City"] = df["City"]
-    output["Original Pincode"] = df["Pincode"]
-    output["Original State"] = df["State"]
-
-    # Keep exact requested 17-column order.
-    output = output[
-        [
-            "Lead Code",
-            "Clean Full Address",
-            "Clean City",
-            "Clean Pincode",
-            "Clean State",
-            "Address Empty",
-            "City Empty",
-            "State Empty",
-            "Pincode Empty",
-            "Pincode Length Valid",
-            "Pincode Starts With Zero",
-            "Address Duplicate Components Removed",
-            "Address Redundancy Cleaned",
-            "Original Full Address",
-            "Original City",
-            "Original Pincode",
-            "Original State",
-        ]
-    ]
-
-    # --------------------------------------------------------
-    # IMPORTANT: NEVER deduplicate rows or Lead Codes.
-    # Duplicate addresses can legitimately belong to different leads.
-    # --------------------------------------------------------
-    output.to_csv(
-        OUTPUT_FILE,
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    # --------------------------------------------------------
-    # Report.
-    # --------------------------------------------------------
-    total_removed_components = sum(
-        count_removed_components(o, c)
-        for o, c in zip(
-            output["Original Full Address"],
-            output["Clean Full Address"],
+    if len(address_columns) < 2:
+        raise ValueError(
+            "At least two address columns are required."
         )
-    )
 
-    rows_with_structured_changes = (
-        (
-            output["Clean City"].map(normalize_for_matching)
-            != output["Original City"].map(normalize_for_matching)
+    postal_offices = build_postal_office_index()
+
+    print("=" * 70)
+    print("MULTI-ADDRESS CLEANING")
+    print("=" * 70)
+    print(f"Input file : {input_file.name}")
+    print(f"Records    : {len(df):,}")
+    print(f"Addresses  : {', '.join(address_columns)}")
+    print()
+
+    created = []
+
+    for address_column in address_columns:
+        print(f"Processing {address_column}...")
+        created.append(
+            process_address_column(
+                df,
+                address_column,
+                ADDRESS_OUTPUTS[address_column],
+                postal_offices,
+            )
         )
-        | (
-            output["Clean State"].map(canonical_state)
-            != output["Original State"].map(canonical_state)
-        )
-        | (
-            output["Clean Pincode"].map(normalize_pin)
-            != output["Original Pincode"].map(normalize_pin)
-        )
-    ).sum()
 
-    report = [
-        "ADDRESS CLEANING REPORT",
-        "=" * 60,
-        f"Input file: {input_file.name}",
-        f"Output file: {OUTPUT_FILE.name}",
-        f"Input rows: {original_rows}",
-        f"Output rows: {len(output)}",
-        f"Rows removed: {original_rows - len(output)}",
-        "Duplicate records removed: 0",
-        "Duplicate Lead Codes / rows removed: 0",
-        f"Rows with structured-field changes: {rows_with_structured_changes}",
-        f"Empty Full Address: {int(output['Address Empty'].sum())}",
-        f"Empty City: {int(output['City Empty'].sum())}",
-        f"Empty State: {int(output['State Empty'].sum())}",
-        f"Empty Pincode: {int(output['Pincode Empty'].sum())}",
-        f"Invalid Pincode Length: {int((~output['Pincode Length Valid']).sum())}",
-        f"Pincodes Starting With Zero: {int(output['Pincode Starts With Zero'].sum())}",
-        (
-            "Address records with redundant components cleaned: "
-            f"{int(output['Address Redundancy Cleaned'].sum())}"
-        ),
-        f"Total address components removed: {total_removed_components}",
-    ]
-
-    REPORT_FILE.write_text(
-        "\n".join(report),
-        encoding="utf-8",
-    )
-
-    print("\n".join(report))
-    print("\nCleaning completed successfully.")
+    print()
+    print("Cleaning completed successfully.")
+    print("Rows are preserved; no deduplication was performed.")
 
 
 if __name__ == "__main__":
-    process_file()
+    process_multi_address_file()
