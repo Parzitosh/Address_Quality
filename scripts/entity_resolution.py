@@ -356,6 +356,15 @@ class GeographicResolver:
             {},
         )
 
+        # Pre-normalize office names once instead of normalizing every office
+        # for every customer row.
+        self.pin_post_office_names = {
+            pin: {normalize_entity(x) for x in offices if x}
+            for pin, offices in self.pin_post_offices.items()
+        }
+        self._pin_context_cache = {}
+        self._ulb_cache = {}
+
         # ----------------------------------------------------
         # Token indexes
         #
@@ -438,9 +447,9 @@ class GeographicResolver:
     ) -> str:
 
         value = row.get(
-            "district_name",
+            "district_name_clean",
             row.get(
-                "district_name_clean",
+                "district_name",
                 row.get(
                     "district",
                     "",
@@ -448,7 +457,7 @@ class GeographicResolver:
             ),
         )
 
-        return normalize_entity(value)
+        return str(value).strip() if value is not None else ""
 
     @staticmethod
     def _row_subdistrict(
@@ -456,17 +465,17 @@ class GeographicResolver:
     ) -> str:
 
         value = row.get(
-            "subdistrict_name",
+            "subdistrict_name_clean",
             row.get(
-                "sub_district_name",
+                "subdistrict_name",
                 row.get(
-                    "subdistrict_name_clean",
+                    "sub_district_name",
                     "",
                 ),
             ),
         )
 
-        return normalize_entity(value)
+        return str(value).strip() if value is not None else ""
 
     @staticmethod
     def _row_state(
@@ -492,7 +501,13 @@ class GeographicResolver:
         pin: str,
     ) -> Tuple[set, set]:
 
-        pin = normalize_pin(pin)
+        pin = normalize_pin(
+            pin
+        )
+
+        cached = self._pin_context_cache.get(pin)
+        if cached is not None:
+            return cached
 
         districts = {
             normalize_entity(x)
@@ -512,7 +527,9 @@ class GeographicResolver:
             if x
         }
 
-        return districts, states
+        result = (districts, states)
+        self._pin_context_cache[pin] = result
+        return result
 
     # ========================================================
     # CONTEXT FILTER
@@ -529,6 +546,11 @@ class GeographicResolver:
 
         if not rows:
             return []
+
+        # With one candidate, the existing context scoring always returns it.
+        # Skip the expensive per-row normalization/scoring path.
+        if len(rows) == 1:
+            return list(rows)
 
         state = canonical_state(state)
 
@@ -1720,7 +1742,6 @@ class GeographicResolver:
             self.ulb_by_name.keys(),
             limit=3,
         )
-
         if not candidates:
 
             return Resolution(
@@ -1815,14 +1836,10 @@ class GeographicResolver:
                 reason="No post office supplied.",
             )
 
-        offices = {
-            normalize_entity(x)
-            for x in self.pin_post_offices.get(
-                pin,
-                set(),
-            )
-            if x
-        }
+        offices = self.pin_post_office_names.get(
+            pin,
+            set(),
+        )
 
         # ----------------------------------------------------
         # Exact
@@ -2186,12 +2203,23 @@ class GeographicResolver:
 
         if city:
 
-            ulb_res = self.resolve_ulb(
-                city,
-                state,
-                effective_district,
-                pin,
+            ulb_key = (
+                normalize_entity(city),
+                canonical_state(state),
+                normalize_entity(effective_district),
+                normalize_pin(pin),
             )
+            ulb_res = self._ulb_cache.get(ulb_key)
+            if ulb_res is None:
+                ulb_res = self.resolve_ulb(
+                    city,
+                    state,
+                    effective_district,
+                    pin,
+                )
+                # Keep memory bounded for very high-cardinality datasets.
+                if len(self._ulb_cache) < 250000:
+                    self._ulb_cache[ulb_key] = ulb_res
 
         else:
 

@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 import pandas as pd
+import argparse
 
 
 # ============================================================
@@ -152,6 +153,27 @@ def canonical_state(value):
         return STATE_ABBREVIATIONS[text]
 
     return STATE_ALIASES.get(text, text)
+
+
+# Precompute state matching structures once. The previous implementation
+# ran ~50 separate regex searches for every address.
+_STATE_VARIANT_TO_CANONICAL = {}
+for _state_value in list(STATE_ALIASES.keys()) + list(STATE_ABBREVIATIONS.keys()):
+    _STATE_VARIANT_TO_CANONICAL[normalize_for_matching(_state_value)] = canonical_state(_state_value)
+
+_STATE_VARIANT_PATTERN = re.compile(
+    r"(?<![A-Z0-9])(?:"
+    + "|".join(
+        re.escape(x)
+        for x in sorted(_STATE_VARIANT_TO_CANONICAL, key=len, reverse=True)
+        if x
+    )
+    + r")(?![A-Z0-9])",
+    flags=re.I,
+)
+
+_STATE_VARIANTS_CACHE = {}
+_STATE_END_PATTERN_CACHE = {}
 
 
 def is_meaningful(value):
@@ -593,68 +615,60 @@ def find_pincode_in_address(address, valid_pins=None):
 
 
 def find_state_in_address(address):
-    """
-    Extract a state from free text.
-
-    Long/full state names are preferred over abbreviations. If multiple
-    states occur, prefer the occurrence nearest the end of the address.
-    """
+    """Extract the latest standalone state/abbreviation with one regex pass."""
     text = normalize_for_matching(address)
     if not text:
         return ""
 
-    candidates = []
-
-    for candidate in STATE_MATCH_ORDER:
-        canonical = canonical_state(candidate)
-        candidate_n = normalize_for_matching(candidate)
-        if not candidate_n:
-            continue
-
-        pattern = rf"(?<![A-Z0-9]){re.escape(candidate_n)}(?![A-Z0-9])"
-        for m in re.finditer(pattern, text, flags=re.I):
-            candidates.append((m.start(), len(candidate_n), canonical))
-
-    if not candidates:
+    matches = list(_STATE_VARIANT_PATTERN.finditer(text))
+    if not matches:
         return ""
 
-    # Prefer the latest occurrence; for equal position prefer the longer match.
-    candidates.sort(key=lambda x: (x[0], x[1]))
-    return candidates[-1][2]
+    return _STATE_VARIANT_TO_CANONICAL.get(
+        matches[-1].group(0).upper(),
+        "",
+    )
 
 
 def state_variants(canonical):
-    """Return full name/abbreviations that map to the canonical state."""
+    """Return cached full-name/abbreviation variants for a canonical state."""
     target = canonical_state(canonical)
     if not target:
         return []
 
-    variants = []
-    for value in list(STATE_ALIASES.keys()) + list(STATE_ABBREVIATIONS.keys()):
-        if canonical_state(value) == target:
-            variants.append(value)
-    variants.append(target)
+    cached = _STATE_VARIANTS_CACHE.get(target)
+    if cached is not None:
+        return cached
 
-    return sorted(
-        set(variants),
-        key=lambda x: len(normalize_for_matching(x)),
-        reverse=True,
-    )
+    variants = [
+        value
+        for value, mapped in _STATE_VARIANT_TO_CANONICAL.items()
+        if mapped == target
+    ]
+    variants.append(normalize_for_matching(target))
+    variants = sorted(set(variants), key=len, reverse=True)
+    _STATE_VARIANTS_CACHE[target] = variants
+    return variants
 
 
 def remove_state_variants(text, state):
     working = normalize_for_matching(text)
-    for variant in state_variants(state):
-        variant_n = normalize_for_matching(variant)
-        if not variant_n:
-            continue
-        working = re.sub(
-            rf"(?<![A-Z0-9]){re.escape(variant_n)}(?![A-Z0-9])",
-            " ",
-            working,
+    variants = state_variants(state)
+    if not variants:
+        return working.strip(" ,")
+
+    key = canonical_state(state)
+    pattern = _STATE_END_PATTERN_CACHE.get(key)
+    if pattern is None:
+        pattern = re.compile(
+            r"(?<![A-Z0-9])(?:"
+            + "|".join(re.escape(x) for x in variants)
+            + r")(?![A-Z0-9])",
             flags=re.I,
         )
-    return re.sub(r"\s+", " ", working).strip(" ,")
+        _STATE_END_PATTERN_CACHE[key] = pattern
+
+    return re.sub(r"\s+", " ", pattern.sub(" ", working)).strip(" ,")
 
 
 def strip_metadata_from_text(text, state="", pincode=""):
@@ -835,6 +849,17 @@ def build_postal_office_index():
     return index
 
 
+def remove_standalone_pincode_segments(text, pincode):
+    """Remove a PIN only when it occupies its own delimiter-separated segment."""
+    pin = normalize_pin(pincode)
+    if not pin:
+        return clean_text(text)
+
+    parts = [p.strip(" ,") for p in re.split(r"[,;|]+", clean_text(text))]
+    kept = [p for p in parts if normalize_for_matching(p) != pin]
+    return ",".join(p for p in kept if p)
+
+
 def clean_single_address(address, city, state, pincode, postal_offices):
     """
     Produce the same cleaned-address structure used by address_quality.py,
@@ -853,9 +878,13 @@ def clean_single_address(address, city, state, pincode, postal_offices):
         postal_offices=postal_offices,
     )
 
+    # Remove an extracted PIN when it appears as its own metadata segment
+    # anywhere in the address (not when embedded in a premise identifier).
+    raw_body = remove_standalone_pincode_segments(raw, pin)
+
     # Clean address body using the extracted metadata.
     cleaned = clean_address(
-        address=raw,
+        address=raw_body,
         city=city_value,
         state=state_value,
         pincode=pin,
@@ -869,24 +898,43 @@ def clean_single_address(address, city, state, pincode, postal_offices):
     }
 
 
-def process_address_column(df, address_column, output_filename, postal_offices):
+def process_address_column(df, address_column, output_filename, postal_offices, clean_cache=None):
     """
     Process one of Current/Office/Alternate Address columns.
 
     LAN is preserved exactly. No row deduplication is performed.
     """
     output_rows = []
+    if clean_cache is None:
+        clean_cache = {}
 
-    for row in df[["LAN", address_column]].itertuples(index=False, name=None):
+    try:
+        from tqdm import tqdm
+        iterator = tqdm(
+            df[["LAN", address_column]].itertuples(index=False, name=None),
+            total=len(df),
+            desc=f"Cleaning {address_column}",
+            unit="row",
+            dynamic_ncols=True,
+        )
+    except ImportError:
+        iterator = df[["LAN", address_column]].itertuples(index=False, name=None)
+
+    for row in iterator:
         lan, raw_address = row
 
-        cleaned = clean_single_address(
-            address=raw_address,
-            city="",
-            state="",
-            pincode="",
-            postal_offices=postal_offices,
-        )
+        cache_key = clean_text(raw_address)
+        cleaned = clean_cache.get(cache_key)
+        if cleaned is None:
+            cleaned = clean_single_address(
+                address=raw_address,
+                city="",
+                state="",
+                pincode="",
+                postal_offices=postal_offices,
+            )
+            if len(clean_cache) < 300000:
+                clean_cache[cache_key] = cleaned
 
         output_rows.append({
             "LAN": lan,
@@ -910,12 +958,22 @@ def process_address_column(df, address_column, output_filename, postal_offices):
     return output_path
 
 
-def process_multi_address_file():
-    input_file = BASE_DIR / "BOBCARD - All Address.csv"
+def process_multi_address_file(input_file=None):
+    if input_file:
+        input_file = Path(input_file)
+        if not input_file.is_absolute():
+            input_file = BASE_DIR / input_file
+    else:
+        candidates = [
+            BASE_DIR / "BOBCARD - All Address.csv",
+            BASE_DIR / "NON RURAL - Query result.csv",
+        ]
+        input_file = next((p for p in candidates if p.exists()), None)
 
-    if not input_file.exists():
+    if input_file is None or not input_file.exists():
         raise FileNotFoundError(
-            f"Raw multi-address file not found:\n{input_file}"
+            "No multi-address raw CSV found. Put the file in the project "
+            "folder or pass --input <file>."
         )
 
     df = pd.read_csv(
@@ -953,6 +1011,9 @@ def process_multi_address_file():
     print()
 
     created = []
+    # Shared across Current/Office/Alternate so identical raw addresses are
+    # cleaned only once. LAN rows are still preserved one-for-one.
+    clean_cache = {}
 
     for address_column in address_columns:
         print(f"Processing {address_column}...")
@@ -962,6 +1023,7 @@ def process_multi_address_file():
                 address_column,
                 ADDRESS_OUTPUTS[address_column],
                 postal_offices,
+                clean_cache=clean_cache,
             )
         )
 
@@ -971,4 +1033,7 @@ def process_multi_address_file():
 
 
 if __name__ == "__main__":
-    process_multi_address_file()
+    parser = argparse.ArgumentParser(description="Clean multi-address customer data")
+    parser.add_argument("--input", help="Raw multi-address CSV path")
+    args = parser.parse_args()
+    process_multi_address_file(args.input)
