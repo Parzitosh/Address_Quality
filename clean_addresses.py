@@ -10,19 +10,6 @@ import argparse
 
 BASE_DIR = Path(__file__).resolve().parent
 
-INPUT_FILE = BASE_DIR / "SMFG - Query result.csv"
-
-OUTPUT_FILE = BASE_DIR / "Cleaned_Address_Data.csv"
-REPORT_FILE = BASE_DIR / "Cleaning_Report.txt"
-
-REQUIRED_COLUMNS = [
-    "Full Address",
-    "City",
-    "Pincode",
-    "State",
-    "Lead Code",
-]
-
 STATE_ALIASES = {
     "ANDHRA PRADESH": "ANDHRA PRADESH",
     "ARUNACHAL PRADESH": "ARUNACHAL PRADESH",
@@ -85,19 +72,8 @@ STATE_ABBREVIATIONS = {
 }
 
 PLACEHOLDER_VALUES = {
-    "",
-    "N/A",
-    "NA",
-    "NIL",
-    "NONE",
-    "NULL",
-    "UNKNOWN",
-    "-",
-    "--",
-    "NOT AVAILABLE",
-    "NOT PROVIDED",
-    "NOT APPLICABLE",
-    "UNAVAILABLE",
+    "", "N/A", "NA", "NIL", "NONE", "NULL", "UNKNOWN",
+    "-", "--", "NOT AVAILABLE", "NOT PROVIDED", "NOT APPLICABLE", "UNAVAILABLE",
 }
 
 
@@ -194,74 +170,6 @@ def count_phrase(text, phrase):
     if not pattern:
         return 0
     return len(re.findall(pattern, normalize_for_matching(text), flags=re.I))
-
-
-# ============================================================
-# STRUCTURED FIELD REPAIR
-# ============================================================
-
-def repair_structured_fields(city, state, pincode):
-    """
-    Repair obvious formatting/cross-column contamination.
-
-    This is deliberately deterministic:
-    - no fuzzy city guessing
-    - no row deletion
-    - no address-to-city guessing
-    """
-    city_clean = clean_text(city)
-    state_clean = canonical_state(state)
-    pin_clean = normalize_pin(pincode)
-
-    # If State is embedded at the end of City, remove it.
-    if state_clean and city_clean:
-        state_pattern = phrase_pattern(state_clean)
-        if state_pattern:
-            city_clean = re.sub(
-                rf"(?:,|\s)+{state_pattern}\s*$",
-                "",
-                normalize_for_matching(city_clean),
-                flags=re.I,
-            ).strip()
-
-    # Recover state if the State column is empty but City ends in a
-    # recognized state/abbreviation.
-    if not state_clean and city_clean:
-        city_norm = normalize_for_matching(city_clean)
-        candidates = sorted(
-            list(STATE_ALIASES.keys()) + list(STATE_ABBREVIATIONS.keys()),
-            key=len,
-            reverse=True,
-        )
-        for candidate in candidates:
-            candidate_n = normalize_for_matching(candidate)
-            if re.search(rf"\b{re.escape(candidate_n)}\s*$", city_norm):
-                state_clean = canonical_state(candidate)
-                city_clean = re.sub(
-                    rf"\s+{re.escape(candidate_n)}\s*$",
-                    "",
-                    city_norm,
-                    flags=re.I,
-                ).strip()
-                break
-
-    # If Pincode contains text + a valid PIN, keep only the PIN.
-    if not pin_clean:
-        # No valid 6-digit PIN means do not invent one.
-        pin_clean = ""
-
-    # If City is empty and Pincode contains city text plus PIN, recover
-    # only when the text portion is clearly non-numeric.
-    if not city_clean and pincode is not None and not pd.isna(pincode):
-        pin_text = str(pincode).strip()
-        pin_match = re.search(r"(?<!\d)\d{6}(?!\d)", pin_text)
-        if pin_match:
-            before = pin_text[:pin_match.start()].strip(" ,-/")
-            before = clean_text(before)
-            if before and is_meaningful(before):
-                city_clean = before
-
-    return city_clean, state_clean, pin_clean
 
 
 # ============================================================
@@ -580,8 +488,6 @@ def clean_address(address, city="", state="", pincode=""):
 
     return clean_text(text)
 
-
-# ============================================================
 
 # ============================================================
 # MULTI-ADDRESS RAW INPUT EXTRACTION
@@ -965,15 +871,14 @@ def process_multi_address_file(input_file=None):
             input_file = BASE_DIR / input_file
     else:
         candidates = [
-            BASE_DIR / "BOBCARD - All Address.csv",
-            BASE_DIR / "NON RURAL - Query result.csv",
+            BASE_DIR / "Standardized_Input.csv",
         ]
         input_file = next((p for p in candidates if p.exists()), None)
 
     if input_file is None or not input_file.exists():
         raise FileNotFoundError(
-            "No multi-address raw CSV found. Put the file in the project "
-            "folder or pass --input <file>."
+            "No multi-address raw CSV found. Run lender_router.py first "
+            "to generate Standardized_Input.csv, or pass --input <file>."
         )
 
     df = pd.read_csv(
@@ -982,7 +887,7 @@ def process_multi_address_file(input_file=None):
         keep_default_na=False,
     )
 
-    required = ["LAN", "Current Address", "Office Address"]
+    required = ["LAN"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(
@@ -995,9 +900,9 @@ def process_multi_address_file(input_file=None):
         if c in df.columns
     ]
 
-    if len(address_columns) < 2:
+    if len(address_columns) < 1:
         raise ValueError(
-            "At least two address columns are required."
+            "At least one standardized address column is required."
         )
 
     postal_offices = build_postal_office_index()
