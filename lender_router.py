@@ -30,8 +30,8 @@ LENDER_CONFIGS = {
         "office": []
     },
     "BOBCARD": {
-        "signature": ["ACCNT_NUM", "ADD_LINE_1", "CITY", "POSTAL_CODE"],
-        "lan": ["ACCNT_NUM"],
+        "signature": ["LAN", "ADD_LINE_1", "CITY", "POSTAL_CODE"],
+        "lan": ["LAN"],
         "current": ["ADD_LINE_1", "ADD_LINE_2", "ADD_LINE_3", "ADD_LINE_4", "CITY", "STATE", "POSTAL_CODE"],
         "office": ["EMP_ADDR_1", "EMP_ADDR_2", "EMP_ADDR_3", "EMP_CITY", "EMP_STATE", "EMP_PIN"],
         "alternate": ["ALT_ADDR_1", "ALT_ADDR_2", "ALT_ADDR_3", "ALT_ADDR_4", "ALT_CITY", "ALT_PIN"]
@@ -86,12 +86,19 @@ LENDER_CONFIGS = {
         "office": []
     },
     "FEDERAL_BANK": {
-        "signature": ["ACCOUNT", "ADDRESS_LINE1", "CITY", "STATE", "PIN"],
-        "lan": ["ACCOUNT"],
-        "current": ["ADDRESS_LINE1", "ADDRESS_LINE2", "ADDRESS_LINE3", "CITY", "STATE", "PIN"],
-        "alternate": ["PERM_ADDRESS_LINE1", "PERM_ADDRESS_LINE2", "PERM_ADDRESS_LINE3", "PERM_CITY", "PERM_STATE", "PERM_PIN"],
-        "office": ["Additional_ADDRESS"]
-    }
+        "signature": ["Account", "Address Line1", "City", "State", "Pin"],
+        "lan": ["Account"],
+        "current": ["Address Line1", "Address Line2", "Address Line3", "City", "State", "Pin"],
+        "alternate": ["Perm Address Line1", "Perm Address Line2", "Perm Address Line3", "Perm City", "Perm State", "Perm Pin"],
+        "office": ["Additional Address"]
+    },
+    "CUSTOM": {
+            "signature": ["LAN", "Address"],
+            "lan": ["LAN"],
+            "current": ["Address"],
+            "alternate": [],
+            "office": []
+        }
 }
 
 # ============================================================

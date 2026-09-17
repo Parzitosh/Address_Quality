@@ -97,29 +97,29 @@ def normalize_pin(value) -> str:
 # STATE NORMALIZATION
 # ============================================================
 
+STATE_ALIASES = {
+    # Full names / legacy spellings
+    "CHHATISGARH": "CHHATTISGARH",
+    "ORISSA": "ODISHA",
+    "PONDICHERRY": "PUDUCHERRY",
+    # Common Indian postal/administrative abbreviations
+    "HR": "HARYANA", "UP": "UTTAR PRADESH", "MP": "MADHYA PRADESH",
+    "HP": "HIMACHAL PRADESH", "RJ": "RAJASTHAN", "PB": "PUNJAB",
+    "WB": "WEST BENGAL", "UK": "UTTARAKHAND", "CG": "CHHATTISGARH",
+    "AP": "ANDHRA PRADESH", "TS": "TELANGANA", "TG": "TELANGANA",
+    "MH": "MAHARASHTRA", "KA": "KARNATAKA", "TN": "TAMIL NADU",
+    "GJ": "GUJARAT", "DL": "DELHI", "KL": "KERALA", "BR": "BIHAR",
+    "JH": "JHARKHAND", "AS": "ASSAM", "OD": "ODISHA",
+    "GA": "GOA", "JK": "JAMMU AND KASHMIR", "J&K": "JAMMU AND KASHMIR",
+    "J AND K": "JAMMU AND KASHMIR", "J K": "JAMMU AND KASHMIR",
+    "PY": "PUDUCHERRY", "UT": "LADAKH",
+}
+
 def canonical_state(value) -> str:
 
     s = normalize_text(value)
 
-    aliases = {
-
-        "HR": "HARYANA",
-        "UP": "UTTAR PRADESH",
-        "MP": "MADHYA PRADESH",
-        "HP": "HIMACHAL PRADESH",
-        "RJ": "RAJASTHAN",
-        "PB": "PUNJAB",
-        "WB": "WEST BENGAL",
-        "UK": "UTTARAKHAND",
-        "CG": "CHHATTISGARH",
-
-        "J AND K": "JAMMU AND KASHMIR",
-        "J K": "JAMMU AND KASHMIR",
-        "J&K": "JAMMU AND KASHMIR",
-
-        "AP": "ANDHRA PRADESH",
-        "TS": "TELANGANA",
-    }
+    aliases = STATE_ALIASES
 
     return aliases.get(
         s,
@@ -546,11 +546,13 @@ def detect_premise(address):
         r"\bKHASRA\s*(?:NO|NUMBER)?\s*[-.:]?\s*[A-Z0-9][A-Z0-9/-]*\b",
         r"\bSURVEY\s*(?:NO|NUMBER)?\s*[-.:]?\s*[A-Z0-9][A-Z0-9/-]*\b",
 
-        # Alphanumeric premise IDs: A-13, D-43, H-338, C-2445.
-        r"(?<![A-Z0-9])[A-Z]{1,3}\s*-\s*\d{1,6}[A-Z0-9/-]*(?![A-Z0-9])",
+        # Alphanumeric premise IDs:
+        # A-13, D-43, H-338, C-2445, and bare IDs such as B36.
+        r"(?<![A-Z0-9])[A-Z]{1,3}\s*-?\s*\d{1,6}[A-Z0-9/-]*(?![A-Z0-9])",
 
-        # Alphanumeric slash IDs: E-49/C-24, RZ-19/C-11-A.
-        r"(?<![A-Z0-9])[A-Z]{1,4}\s*-\s*\d{1,6}(?:/[A-Z]{1,4}\s*-\s*\d{1,6})+(?:-[A-Z0-9]+)?",
+        # Mixed alphanumeric slash IDs:
+        # E-49/C-24, 62/A/1, 12A/3B, RZ-19/C-11-A.
+        r"(?<![A-Z0-9])[A-Z0-9]{1,6}(?:\s*-?\s*[A-Z0-9]{1,6})?(?:\s*/\s*[A-Z0-9]{1,6})+(?:\s*-\s*[A-Z0-9]+)*(?![A-Z0-9])",
 
         # Numeric premise IDs: 23/5, 391/20, 12/48, 121/2.
         r"(?<![A-Z0-9])\d{1,6}\s*/\s*\d{1,6}(?:\s*/\s*\d{1,6})?(?![A-Z0-9])",
@@ -580,6 +582,7 @@ def detect_building(address):
 
             r"\b(?:APARTMENTS?|TOWER|COMPLEX|BUILDING|RESIDENCY|RESIDENCIES|"
             r"HEIGHTS|PLAZA|ARCADE|BHAVAN|BUNGALOW|VILLA|VILLAS|"
+            r"SHED|GODOWN|WAREHOUSE|UNIT|INDUSTRIAL\s+ESTATE|"
             r"SHOPPING\s+(?:CENTRE|CENTER|COMPLEX)|OFFICE\s+(?:COMPLEX|BLOCK))\b",
             r"\b(?:SOCIETY|CO\.?\s*OP\.?\s*HOUSING)\b",
 

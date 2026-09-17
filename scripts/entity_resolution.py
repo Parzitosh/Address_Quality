@@ -21,25 +21,7 @@ except ImportError:
 # ALIASES
 # ============================================================
 
-STATE_ALIASES = {
-    "HR": "HARYANA",
-    "UP": "UTTAR PRADESH",
-    "MP": "MADHYA PRADESH",
-    "HP": "HIMACHAL PRADESH",
-    "RJ": "RAJASTHAN",
-    "PB": "PUNJAB",
-    "WB": "WEST BENGAL",
-    "UK": "UTTARAKHAND",
-    "CG": "CHHATTISGARH",
-    "CHHATISGARH": "CHHATTISGARH",
-    "J AND K": "JAMMU AND KASHMIR",
-    "J K": "JAMMU AND KASHMIR",
-    "J&K": "JAMMU AND KASHMIR",
-    "AP": "ANDHRA PRADESH",
-    "TS": "TELANGANA",
-    "ORISSA": "ODISHA",
-    "PONDICHERRY": "PUDUCHERRY",
-}
+from validators import STATE_ALIASES
 
 
 COMMON_ALIASES = {

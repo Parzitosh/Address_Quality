@@ -1,95 +1,93 @@
-import pandas as pd
+from __future__ import annotations
+
+import re
 from pathlib import Path
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parent
+OUTPUT_DIR = ROOT / "output"
 
 QUALITY_FILES = {
-    "Current Address": ROOT / "output" / "address_quality_current.csv",
-    "Office Address": ROOT / "output" / "address_quality_office.csv",
-    "Alternate Address": ROOT / "output" / "address_quality_alternate.csv",
+    "Current Address": OUTPUT_DIR / "address_quality_current.csv",
+    "Office Address": OUTPUT_DIR / "address_quality_office.csv",
+    "Alternate Address": OUTPUT_DIR / "address_quality_alternate.csv",
 }
 
-OUTPUT_FILE = ROOT / "output" / "final_address_quality.csv"
+FINAL_OUTPUT = OUTPUT_DIR / "final_address_quality.csv"
+AUDIT_OUTPUT = OUTPUT_DIR / "final_address_quality_audit.csv"
+
+NO_RESOLUTION = "didn't needed any resolving"
 
 
-def clean_value(value):
+def clean_value(value) -> str:
     if value is None:
         return ""
-
     try:
         if pd.isna(value):
             return ""
     except Exception:
         pass
-
     return str(value).strip()
 
 
-def combine_address(row):
+def normalized_pin(value: str) -> str:
+    text = clean_value(value)
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".")[0]
+    digits = re.sub(r"\D", "", text)
+    return digits if len(digits) == 6 else ""
+
+
+def combine_address(row) -> str:
     address = clean_value(row.get("Clean Full Address", ""))
     city = clean_value(row.get("Clean City", ""))
     state = clean_value(row.get("Clean State", ""))
-    pin = clean_value(row.get("Clean Pincode", ""))
-
+    pin = normalized_pin(row.get("Clean Pincode", ""))
     parts = [address]
-
-    # Avoid duplicating metadata if the cleaner has already retained it.
     existing = " ".join(parts).upper()
-
     for value in [city, state, pin]:
-        if not value:
-            continue
-
-        if value.upper() not in existing:
+        if value and value.upper() not in existing:
             parts.append(value)
             existing = " ".join(parts).upper()
-
     return ", ".join(x for x in parts if x)
 
 
-def load_quality(path):
+def load_quality(path: Path):
     if not path.exists():
         raise FileNotFoundError(
-            f"Quality output not found: {path}\n"
-            "Run run_address_quality.py first."
+            f"Required quality output not found: {path}. "
+            f"Run run_address_quality.py first."
         )
 
-    df = pd.read_csv(
-        path,
-        dtype=str,
-        keep_default_na=False,
-    )
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
 
-    if "LAN" not in df.columns:
-        raise ValueError(f"LAN column missing from {path}")
-
-    # These are required for the final output.
-    required_quality_columns = [
+    required = {
+        "LAN",
         "quality_class",
         "raw_quality_score",
-    ]
-
-    missing = [
-        col for col in required_quality_columns
-        if col not in df.columns
-    ]
-
+        "Clean Full Address",
+        "Clean City",
+        "Clean State",
+        "Clean Pincode",
+    }
+    missing = required - set(df.columns)
     if missing:
         raise ValueError(
-            f"Required quality columns missing from {path}: {missing}"
+            f"Required columns missing from {path}: {sorted(missing)}"
         )
 
     return df
 
 
 def validate_alignment(base, other, base_name, other_name):
-    if len(other) != len(base):
+    if len(base) != len(other):
         raise ValueError(
             f"{base_name} and {other_name} row counts do not match."
         )
 
-    if not other["LAN"].reset_index(drop=True).equals(
-        base["LAN"].reset_index(drop=True)
+    if not base["LAN"].reset_index(drop=True).equals(
+        other["LAN"].reset_index(drop=True)
     ):
         raise ValueError(
             f"LAN ordering does not match between "
@@ -97,119 +95,116 @@ def validate_alignment(base, other, base_name, other_name):
         )
 
 
+def build_audit_remark(df):
+    # Prefer the audit/resolution information already emitted by the
+    # upstream quality pipeline, if present. Otherwise do not invent a
+    # resolution event.
+    audit_candidates = [
+        "audit remark",
+        "audit_remark",
+        "resolution_remark",
+        "qc_resolution_remark",
+    ]
+
+    for column in audit_candidates:
+        if column in df.columns:
+            return df[column].apply(
+                lambda x: clean_value(x) or NO_RESOLUTION
+            )
+
+    return pd.Series(NO_RESOLUTION, index=df.index)
+
+
 def main():
-    # ---------------------------------------------------------
-    # LOAD QUALITY OUTPUTS
-    # ---------------------------------------------------------
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    current = load_quality(
-        QUALITY_FILES["Current Address"]
+    # IMPORTANT ARCHITECTURE:
+    # final_output.py is a downstream assembler only.
+    # It NEVER runs address_quality.py and NEVER performs State/City/PIN
+    # auto-resolution. Those steps belong upstream.
+    current = load_quality(QUALITY_FILES["Current Address"])
+
+    office = (
+        load_quality(QUALITY_FILES["Office Address"])
+        if QUALITY_FILES["Office Address"].exists()
+        else None
     )
 
-    office = load_quality(
-        QUALITY_FILES["Office Address"]
+    alternate = (
+        load_quality(QUALITY_FILES["Alternate Address"])
+        if QUALITY_FILES["Alternate Address"].exists()
+        else None
     )
 
-    validate_alignment(
-        current,
-        office,
-        "Current Address",
-        "Office Address",
-    )
+    if office is not None:
+        validate_alignment(
+            current, office, "Current Address", "Office Address"
+        )
 
-    # ---------------------------------------------------------
-    # BUILD FINAL OUTPUT
-    # ---------------------------------------------------------
+    if alternate is not None:
+        validate_alignment(
+            current, alternate, "Current Address", "Alternate Address"
+        )
 
     result = pd.DataFrame({
         "LAN": current["LAN"],
-
-        # Current Address
-        "Clean Current Address": current.apply(
-            combine_address,
-            axis=1,
-        ),
+        "Clean Current Address": current.apply(combine_address, axis=1),
         "Current Quality Class": current["quality_class"],
         "Current Raw Quality Score": current["raw_quality_score"],
-
-        # Office Address
-        "Clean Office Address": office.apply(
-            combine_address,
-            axis=1,
-        ),
-        "Office Quality Class": office["quality_class"],
-        "Office Raw Quality Score": office["raw_quality_score"],
     })
 
-    # ---------------------------------------------------------
-    # ALTERNATE ADDRESS
-    # ---------------------------------------------------------
+    audit = pd.DataFrame({"LAN": current["LAN"]})
+    audit["CURRENT_ADDRESS"] = current.apply(combine_address, axis=1)
+    audit["CURRENT_ADDRESS_AUDIT_REMARK"] = build_audit_remark(current)
+    audit["CURRENT_QUALITY_CLASS"] = current["quality_class"]
 
-    if QUALITY_FILES["Alternate Address"].exists():
-
-        alternate = load_quality(
-            QUALITY_FILES["Alternate Address"]
+    if office is not None:
+        result["Clean Office Address"] = office.apply(
+            combine_address, axis=1
         )
+        result["Office Quality Class"] = office["quality_class"]
+        result["Office Raw Quality Score"] = office["raw_quality_score"]
 
-        validate_alignment(
-            current,
-            alternate,
-            "Current Address",
-            "Alternate Address",
+        audit["OFFICE_ADDRESS"] = office.apply(
+            combine_address, axis=1
         )
+        audit["OFFICE_ADDRESS_AUDIT_REMARK"] = build_audit_remark(office)
+        audit["OFFICE_QUALITY_CLASS"] = office["quality_class"]
+    else:
+        audit["OFFICE_ADDRESS"] = ""
+        audit["OFFICE_ADDRESS_AUDIT_REMARK"] = NO_RESOLUTION
+        audit["OFFICE_QUALITY_CLASS"] = ""
 
+    if alternate is not None:
         result["Clean Alternate Address"] = alternate.apply(
-            combine_address,
-            axis=1,
+            combine_address, axis=1
         )
+        result["Alternate Quality Class"] = alternate["quality_class"]
+        result["Alternate Raw Quality Score"] = alternate["raw_quality_score"]
 
-        result["Alternate Quality Class"] = (
-            alternate["quality_class"]
+        audit["ALTERNATE_ADDRESS"] = alternate.apply(
+            combine_address, axis=1
         )
+        audit["ALTERNATE_ADDRESS_AUDIT_REMARK"] = build_audit_remark(alternate)
+        audit["ALTERNATE_QUALITY_CLASS"] = alternate["quality_class"]
+    else:
+        audit["ALTERNATE_ADDRESS"] = ""
+        audit["ALTERNATE_ADDRESS_AUDIT_REMARK"] = NO_RESOLUTION
+        audit["ALTERNATE_QUALITY_CLASS"] = ""
 
-        result["Alternate Raw Quality Score"] = (
-            alternate["raw_quality_score"]
-        )
-
-    # ---------------------------------------------------------
-    # SAVE
-    # ---------------------------------------------------------
-
-    OUTPUT_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    result.to_csv(
-        OUTPUT_FILE,
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    # ---------------------------------------------------------
-    # SUMMARY
-    # ---------------------------------------------------------
+    result.to_csv(FINAL_OUTPUT, index=False, encoding="utf-8-sig")
+    audit.to_csv(AUDIT_OUTPUT, index=False, encoding="utf-8-sig")
 
     print("=" * 70)
-    print("FINAL MULTI-ADDRESS OUTPUT")
+    print("FINAL ADDRESS QUALITY OUTPUT")
     print("=" * 70)
-
     print(f"Records: {len(result):,}")
-    print(f"Output : {OUTPUT_FILE}")
-
-    print("\nColumns:")
-    for column in result.columns:
-        print(f"  - {column}")
-
-    print("\nQuality columns included:")
-    print("  - Current Quality Class")
-    print("  - Current Raw Quality Score")
-    print("  - Office Quality Class")
-    print("  - Office Raw Quality Score")
-
-    if "Alternate Quality Class" in result.columns:
-        print("  - Alternate Quality Class")
-        print("  - Alternate Raw Quality Score")
+    print(f"Final  : {FINAL_OUTPUT}")
+    print(f"Audit  : {AUDIT_OUTPUT}")
+    print()
+    print("final_output.py consumed existing run_address_quality outputs only.")
+    print("No quality engine was re-run.")
+    print("No State/City/PIN resolution was performed here.")
 
 
 if __name__ == "__main__":

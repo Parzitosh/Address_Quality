@@ -24,6 +24,7 @@ from validators import (
     PASS,
     FAIL,
     AMBIGUOUS,
+    NOT_CHECKED,
     validate_address_present,
     validate_pin_format,
     validate_pin_exists,
@@ -1964,6 +1965,15 @@ def main():
             geo_confidence_fraction = 0.75
         elif ps.status == AMBIGUOUS:
             geo_confidence_fraction = 0.5
+        elif ps.status == NOT_CHECKED:
+            # Missing state is absence of customer input, not a contradiction.
+            # If PIN->district evidence is available, retain partial
+            # administrative confidence instead of wiping out this 10-point
+            # component.
+            if pin_district_status == PASS:
+                geo_confidence_fraction = 0.85
+            else:
+                geo_confidence_fraction = 0.5
 
         # ====================================================
         # FINAL SCORE
@@ -2027,8 +2037,17 @@ def main():
 
         # Operational routing is deliberately separate from quality_class.
         # Hard invalids always reject; otherwise score bands route the work.
-        if hard_invalid or scores["quality_score"] < 60:
+        # Operational routing is separate from quality classification.
+        # fatal_rejects is reserved strictly for genuinely hard-invalid
+        # records. Non-hard-invalid low-score records remain actionable.
+        if hard_invalid:
             operational_queue = "fatal_rejects"
+        elif quality_class == "REQUIRES_CALL":
+            operational_queue = "customer_contact_required"
+        elif scores["quality_score"] < 60:
+            # Non-hard-invalid scores below the normal usable threshold are
+            # still reviewable; never classify them as terminal rejects.
+            operational_queue = "manual_review"
         elif scores["quality_score"] >= 85:
             operational_queue = "auto_dispatch"
         else:
