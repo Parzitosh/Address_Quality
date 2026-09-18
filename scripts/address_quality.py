@@ -2026,10 +2026,10 @@ def main():
         # below the INVALID threshold so quality_class and quality_score
         # remain mathematically consistent.
         if hard_invalid:
-            scores["quality_score"] = min(
-                raw_quality_score,
-                39.99,
-            )
+            if address_present.status == FAIL or garbage.status == FAIL:
+                scores["quality_score"] = 0.0
+            else:
+                scores["quality_score"] = min(raw_quality_score, 39.99)
 
         quality_class = classify_score(
             scores["quality_score"]

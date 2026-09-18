@@ -100,6 +100,7 @@ def build_audit_remark(df):
     # upstream quality pipeline, if present. Otherwise do not invent a
     # resolution event.
     audit_candidates = [
+        "auto_resolution_remark",
         "audit remark",
         "audit_remark",
         "resolution_remark",
